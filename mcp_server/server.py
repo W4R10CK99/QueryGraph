@@ -4,7 +4,8 @@ import os
 
 mcp = FastMCP("fastquery-tools")
 
-DB_PATH = os.path.join("db", "sales.db")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(BASE_DIR, "database", "sales.db")
 
 
 # ---------------------------------------------------

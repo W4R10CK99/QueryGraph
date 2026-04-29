@@ -1,4 +1,4 @@
-import asyncio
+import json
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from app.llm import parse_query
@@ -7,11 +7,34 @@ from app.dashboard_builder import build_dashboard
 
 
 # ---------------------------------------------------
-# Async Pipeline
+# Convert MCP wrapped responses to plain JSON
+# ---------------------------------------------------
+def unwrap_mcp_response(result):
+    """
+    Converts MCP tool output like:
+    [{"type":"text","text":"...json..."}]
+
+    into native python objects.
+    """
+
+    if isinstance(result, list) and len(result) > 0:
+        first = result[0]
+
+        if isinstance(first, dict) and "text" in first:
+            text = first["text"]
+
+            try:
+                return json.loads(text)
+            except:
+                return text
+
+    return result
+
+
+# ---------------------------------------------------
+# Main Pipeline
 # ---------------------------------------------------
 async def run_pipeline(user_query: str):
-
-    # MCP Client
     client = MultiServerMCPClient(
         {
             "fastquery": {
@@ -22,41 +45,36 @@ async def run_pipeline(user_query: str):
         }
     )
 
-    # ------------------------------------------------
-    # Load Tools
-    # ------------------------------------------------
     tools = await client.get_tools()
-
     tool_map = {tool.name: tool for tool in tools}
 
-    # ------------------------------------------------
-    # Tool 1: Schema
-    # ------------------------------------------------
-    schema = await tool_map["get_schema"].ainvoke({})
+    # --------------------------------------------
+    # Tool: Schema
+    # --------------------------------------------
+    raw_schema = await tool_map["get_schema"].ainvoke({})
+    schema = unwrap_mcp_response(raw_schema)
 
-    # (Later we pass schema into LangChain prompt directly)
     print("Loaded Schema:", schema)
 
-    # ------------------------------------------------
-    # Existing LLM
-    # ------------------------------------------------
+    # --------------------------------------------
+    # LLM Intent
+    # --------------------------------------------
     intent = parse_query(user_query)
 
-    # ------------------------------------------------
-    # SQL Build
-    # ------------------------------------------------
+    # --------------------------------------------
+    # SQL
+    # --------------------------------------------
     sql = generate_sql(intent)
 
-    # ------------------------------------------------
-    # Tool 2: Run SQL
-    # ------------------------------------------------
-    data = await tool_map["run_sql"].ainvoke({
-        "sql": sql
-    })
+    # --------------------------------------------
+    # Tool: Run SQL
+    # --------------------------------------------
+    raw_data = await tool_map["run_sql"].ainvoke({"sql": sql})
+    data = unwrap_mcp_response(raw_data)
 
-    # ------------------------------------------------
+    # --------------------------------------------
     # Dashboard
-    # ------------------------------------------------
+    # --------------------------------------------
     dashboard = build_dashboard(intent, data)
 
     return {
