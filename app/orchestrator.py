@@ -1,9 +1,13 @@
 import json
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-from app.llm import parse_query
 from app.query_builder import generate_sql
-from app.dashboard_builder import build_dashboard
+from app.agents.planner_agent import plan_dashboard
+
+import logging
+logger = logging.getLogger(__name__)
+
+print("######## ORCHESTRATOR LOADED ########")
 
 
 # ---------------------------------------------------
@@ -44,42 +48,46 @@ async def run_pipeline(user_query: str):
             }
         }
     )
-
+    print("######## RUN_PIPELINE EXECUTED ########")
     tools = await client.get_tools()
     tool_map = {tool.name: tool for tool in tools}
 
-    # --------------------------------------------
-    # Tool: Schema
-    # --------------------------------------------
+    # Load schema
     raw_schema = await tool_map["get_schema"].ainvoke({})
     schema = unwrap_mcp_response(raw_schema)
 
     print("Loaded Schema:", schema)
 
-    # --------------------------------------------
-    # LLM Intent
-    # --------------------------------------------
-    intent = parse_query(user_query)
+    print("######## CALLING PLANNER ########")
 
-    # --------------------------------------------
-    # SQL
-    # --------------------------------------------
-    sql = generate_sql(intent)
+    # ONLY planner agent
+    dashboard_plan = plan_dashboard(user_query, schema)
 
-    # --------------------------------------------
-    # Tool: Run SQL
-    # --------------------------------------------
-    raw_data = await tool_map["run_sql"].ainvoke({"sql": sql})
-    data = unwrap_mcp_response(raw_data)
+    # Run each widget query
+    for widget in dashboard_plan["widgets"]:
 
-    # --------------------------------------------
-    # Dashboard
-    # --------------------------------------------
-    dashboard = build_dashboard(intent, data)
+        if "metric" not in widget:
+            continue
+
+        intent = {
+            "metric": widget.get("metric", "sales"),
+            "group_by": widget.get("group_by", []),
+            "filters": {},
+            "operation": "sum",
+            "limit": widget.get("limit"),
+            "sort": widget.get("sort"),
+            "chart": widget.get("chart", "bar"),
+            "dashboard_meta": {}
+        }
+
+        sql = generate_sql(intent)
+
+        raw_data = await tool_map["run_sql"].ainvoke({"sql": sql})
+        data = unwrap_mcp_response(raw_data)
+
+        widget["data"] = data
+        widget["sql"] = sql
 
     return {
-        "intent": intent,
-        "sql": sql,
-        "data": data,
-        "dashboard": dashboard
+        "dashboard": dashboard_plan
     }
