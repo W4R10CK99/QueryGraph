@@ -4,3 +4,4 @@ __pycache__/
 .next/
 node_modules/
 *.pyc
+deep-research-report.md
