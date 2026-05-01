@@ -9,10 +9,8 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# LLM — lazy init so missing API key fails at call time, not import time
-# ---------------------------------------------------------------------------
 _llm = None
+
 
 def _get_llm():
     global _llm
@@ -21,8 +19,6 @@ def _get_llm():
         if not api_key:
             raise EnvironmentError("GEMINI_API_KEY is not set in environment.")
         _llm = ChatGoogleGenerativeAI(
-            # FIX: "gemini-3-flash-preview" does not exist.
-            # Use "gemini-1.5-flash" (stable) or "gemini-2.0-flash" (latest preview).
             model="gemini-2.5-flash",
             temperature=0,
             google_api_key=api_key,
@@ -30,9 +26,6 @@ def _get_llm():
     return _llm
 
 
-# ---------------------------------------------------------------------------
-# Safe JSON parser — logs the error instead of silently discarding it
-# ---------------------------------------------------------------------------
 def safe_json(text: str) -> dict:
     try:
         cleaned = text.replace("```json", "").replace("```", "").strip()
@@ -42,20 +35,52 @@ def safe_json(text: str) -> dict:
         return {}
 
 
-# ---------------------------------------------------------------------------
-# Dashboard planner
-#
-# KEY FIX: The prompt now asks the LLM to return `table`, `operation`,
-# `filters`, `limit`, and `sort` in each widget. Without these fields, the
-# orchestrator was silently defaulting everything to "sum", "sales", empty
-# filters, and no limit — making the SQL output identical for every widget.
-# ---------------------------------------------------------------------------
+def _infer_first_table(schema: dict) -> str:
+    if isinstance(schema, dict):
+        tables = list(schema.keys())
+        if tables:
+            return tables[0]
+    return "sales"
+
+
+def _fallback_plan(schema: dict, user_query: str) -> dict:
+    table = _infer_first_table(schema)
+    return {
+        "title": f"Dashboard for {user_query}",
+        "widgets": [
+            {
+                "id": "w1",
+                "type": "kpi_card",
+                "title": "Total Sales",
+                "table": table,
+                "metric": "sales",
+                "operation": "sum",
+                "group_by": [],
+                "filters": {},
+                "sort": None,
+                "limit": None,
+                "chart": "bar",
+                "priority": 1,
+            },
+            {
+                "id": "w2",
+                "type": "table",
+                "title": "Raw Data",
+                "table": table,
+                "metric": "sales",
+                "operation": "sum",
+                "group_by": [],
+                "filters": {},
+                "sort": None,
+                "limit": 20,
+                "chart": "bar",
+                "priority": 99,
+            },
+        ],
+    }
+
+
 def plan_dashboard(user_query: str, schema: dict) -> dict:
-    """
-    Returns a dashboard plan — a dict with `title` and `widgets` list.
-    Each widget is fully self-describing so the orchestrator can build SQL
-    without guessing defaults.
-    """
     prompt = f"""
 You are an expert BI dashboard planner. Given a user query and a database schema,
 produce a JSON dashboard layout that tells the frontend exactly what to render
@@ -91,6 +116,8 @@ Return ONLY a JSON object — no markdown fences, no explanation:
 
 RULES — follow strictly:
 - Use only table/column names that exist in the provided schema.
+- You MUST return at least 1 widget.
+- Never return "widgets": [].
 - "overview" or "summary" queries → start with 1-2 KPI cards, then charts.
 - "compare <dimension>" → bar_chart grouped by that dimension.
 - "trend over time / monthly" → line_chart grouped by the time column.
@@ -114,30 +141,13 @@ RULES — follow strictly:
         if not plan or "widgets" not in plan:
             raise ValueError("LLM returned empty or malformed plan.")
 
+        if not isinstance(plan.get("widgets"), list) or len(plan["widgets"]) == 0:
+            raise ValueError("LLM returned a plan with zero widgets.")
+
     except Exception as e:
         logger.error("plan_dashboard failed: %s", e)
-        # Minimal fallback so the pipeline doesn't crash
-        plan = {
-            "title": "Dashboard",
-            "widgets": [
-                {
-                    "id": "w1",
-                    "type": "kpi_card",
-                    "title": "Total Sales",
-                    "table": _infer_first_table(schema),
-                    "metric": "sales",
-                    "operation": "sum",
-                    "group_by": [],
-                    "filters": {},
-                    "sort": None,
-                    "limit": None,
-                    "chart": "bar",
-                    "priority": 1,
-                }
-            ],
-        }
+        plan = _fallback_plan(schema, user_query)
 
-    # Ensure required fields have safe defaults on every widget
     for i, w in enumerate(plan.get("widgets", [])):
         w.setdefault("id", f"w{i+1}")
         w.setdefault("operation", "sum")
@@ -146,26 +156,11 @@ RULES — follow strictly:
         w.setdefault("sort", None)
         w.setdefault("limit", None)
         w.setdefault("table", _infer_first_table(schema))
+        w.setdefault("type", "table" if w.get("id") == "w2" else "kpi_card")
 
-    plan["widgets"] = sorted(
-        plan["widgets"], key=lambda x: x.get("priority", 999)
-    )
-
+    plan["widgets"] = sorted(plan.get("widgets", []), key=lambda x: x.get("priority", 999))
     return plan
 
 
-def _infer_first_table(schema: dict) -> str:
-    """Best-effort: return the first table name from the schema dict."""
-    if isinstance(schema, dict):
-        tables = list(schema.keys())
-        if tables:
-            return tables[0]
-    return "sales"
-
-
-# ---------------------------------------------------------------------------
-# Async wrapper — call this from the async orchestrator so it doesn't block
-# the FastAPI event loop (plan_dashboard is a sync/blocking LLM call).
-# ---------------------------------------------------------------------------
 async def plan_dashboard_async(user_query: str, schema: dict) -> dict:
     return await asyncio.to_thread(plan_dashboard, user_query, schema)
